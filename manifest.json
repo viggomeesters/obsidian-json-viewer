@@ -1,7 +1,7 @@
 {
   "id": "json-viewer",
   "name": "JSON Viewer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "1.5.0",
   "description": "Browse .json, .jsonl, and .ndjson files as a read-only tree with search, outline navigation, and syntax-highlighted source.",
   "author": "Viggo Meesters",
