@@ -411,3 +411,30 @@
     position: static;
   }
 }
+
+.json-viewer__more {
+  background: transparent;
+  border: 1px dashed var(--json-viewer-border);
+  border-radius: 4px;
+  box-shadow: none;
+  color: var(--json-viewer-muted);
+  cursor: pointer;
+  font-family: var(--json-viewer-code);
+  font-size: 0.82em;
+  height: auto;
+  margin: 4px 0 4px 6px;
+  padding: 2px 10px;
+}
+
+.json-viewer__more:hover,
+.json-viewer__more:focus-visible {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.json-viewer__filter-status {
+  color: var(--json-viewer-muted);
+  font-family: var(--json-viewer-code);
+  font-size: 0.82em;
+  margin-bottom: 8px;
+}

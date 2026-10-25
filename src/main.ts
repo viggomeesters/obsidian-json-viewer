@@ -10,7 +10,15 @@ import {
 const VIEW_TYPE_JSON_VIEWER = "json-viewer";
 const JSON_EXTENSIONS = ["json", "jsonl", "ndjson"];
 const OUTLINE_MAX_DEPTH = 4;
+const OUTLINE_ITEM_LIMIT = 1000;
 const JSONL_RENDER_LIMIT = 1000;
+// Documents up to this many nodes open fully expanded; larger ones render lazily.
+const EAGER_EXPAND_NODE_LIMIT = 2000;
+const CHILD_PAGE_SIZE = 250;
+const EXPAND_ALL_ROW_LIMIT = 5000;
+const FILTER_MATCH_LIMIT = 1000;
+const FILTER_DEBOUNCE_MS = 200;
+const RAW_PAGE_LINES = 2000;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -34,11 +42,31 @@ interface JsonlRecord {
   value: JsonValue;
 }
 
+interface TreeNode {
+  label: string;
+  path: string;
+  value: JsonValue;
+}
+
 interface JsonDocument {
   mode: "json" | "jsonl";
-  roots: Array<{ label: string; path: string; value: JsonValue }>;
+  roots: TreeNode[];
   errors: JsonParseError[];
   skippedRecords: number;
+}
+
+interface BranchState {
+  node: TreeNode;
+  keys: string[] | null;
+  // Indexes of the children that survive the active filter; null renders every child.
+  visibleChildren: number[] | null;
+  rendered: number;
+  more: HTMLElement | null;
+}
+
+interface FilterResult {
+  matches: number;
+  truncated: boolean;
 }
 
 export default class JsonViewerPlugin extends Plugin {
@@ -75,6 +103,8 @@ export default class JsonViewerPlugin extends Plugin {
 }
 
 class JsonViewerView extends TextFileView {
+  private filterTimer: number | null = null;
+
   constructor(leaf: WorkspaceLeaf) {
     super(leaf);
   }
@@ -101,11 +131,24 @@ class JsonViewerView extends TextFileView {
   }
 
   clear(): void {
+    this.cancelFilter();
     this.data = "";
     this.contentEl.empty();
   }
 
+  async onClose(): Promise<void> {
+    this.cancelFilter();
+  }
+
+  private cancelFilter(): void {
+    if (this.filterTimer !== null) {
+      window.clearTimeout(this.filterTimer);
+      this.filterTimer = null;
+    }
+  }
+
   private render(): void {
+    this.cancelFilter();
     const container = this.contentEl;
     container.empty();
     container.addClass("json-viewer");
@@ -152,41 +195,375 @@ class JsonViewerView extends TextFileView {
       renderJsonlSummary(main, document);
     }
 
-    const tree = main.createDiv({ cls: "json-viewer__tree" });
-    const outlineItems: OutlineItem[] = [];
+    const filterStatus = main.createDiv({ cls: "json-viewer__filter-status json-viewer__hidden" });
+    const treeEl = main.createDiv({ cls: "json-viewer__tree" });
+    const eager = countNodes(document.roots, EAGER_EXPAND_NODE_LIMIT) <= EAGER_EXPAND_NODE_LIMIT;
+    const tree = new JsonTree(treeEl, document.roots, eager);
 
-    if (document.roots.length === 0) {
-      tree.createDiv({
-        cls: "json-viewer__empty",
-        text: "This JSON file is empty.",
-      });
-    } else {
-      document.roots.forEach((root) => {
-        outlineItems.push(...collectOutline(root.value, root.path, root.label, 0, document.mode));
-        renderNode(tree, root.value, root.path, root.label);
-      });
-    }
+    const outline = collectOutline(document.roots, document.mode);
 
-    renderOutline(body, tree, outlineItems);
+    const runFilter = (): void => {
+      this.filterTimer = null;
+      const query = searchInput.value;
+      const result = tree.setFilter(query);
+      filterOutline(outlineButtons, outline.items, query);
+      renderFilterStatus(filterStatus, query, result);
+    };
+
+    const outlineButtons = renderOutline(body, outline.items, outline.truncated, (path) => {
+      let target = tree.reveal(path);
+      if (!target && searchInput.value) {
+        searchInput.value = "";
+        this.cancelFilter();
+        runFilter();
+        target = tree.reveal(path);
+      }
+      if (!target) return;
+      if (target.instanceOf(HTMLDetailsElement)) target.open = true;
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+      target.addClass("json-viewer__pulse");
+      window.setTimeout(() => target.removeClass("json-viewer__pulse"), 900);
+    });
 
     searchInput.addEventListener("input", () => {
-      applyFilter(tree, outlineItems, searchInput.value);
+      this.cancelFilter();
+      this.filterTimer = window.setTimeout(runFilter, FILTER_DEBOUNCE_MS);
     });
 
     expandButton.addEventListener("click", () => {
-      tree.querySelectorAll("details").forEach((detail) => {
-        detail.setAttribute("open", "");
-      });
+      if (!tree.expandAll()) {
+        new Notice(`Expanded the first ${EXPAND_ALL_ROW_LIMIT} rows; this file is too large to expand fully.`);
+      }
     });
 
     collapseButton.addEventListener("click", () => {
-      tree.querySelectorAll("details").forEach((detail) => {
-        detail.removeAttribute("open");
-      });
+      tree.collapseAll();
     });
 
     renderRaw(main, this.data, document.mode);
   }
+}
+
+/**
+ * Renders the tree on demand: a branch's children are built the first time it opens, and
+ * large branches are built in pages, so a large file costs only the rows actually on screen.
+ */
+class JsonTree {
+  private readonly elements = new Map<string, HTMLElement>();
+  private readonly branches = new WeakMap<HTMLElement, BranchState>();
+  private readonly copyTemplate: HTMLElement;
+  private matches: Set<string> | null = null;
+  private ancestors: Set<string> | null = null;
+
+  constructor(
+    private readonly container: HTMLElement,
+    private readonly roots: TreeNode[],
+    private readonly eager: boolean,
+  ) {
+    this.copyTemplate = createButton(createDiv(), "copy", "Copy JSON Pointer");
+    this.copyTemplate.addClass("json-viewer__copy");
+
+    container.addEventListener("click", (event) => {
+      const target = event.target as Element;
+
+      const copy = target.closest(".json-viewer__copy");
+      if (copy) {
+        event.preventDefault();
+        event.stopPropagation();
+        const path = copy.closest<HTMLElement>("[data-path]")?.dataset.path ?? "";
+        void copyToClipboard(path || "/", `Copied ${path || "/"}`);
+        return;
+      }
+
+      const more = target.closest(".json-viewer__more");
+      const branch = more?.closest<HTMLElement>("details");
+      const state = branch ? this.branches.get(branch) : undefined;
+      if (branch && state) {
+        this.renderChildPage(branch, state, 0);
+      }
+    });
+
+    this.render();
+  }
+
+  setFilter(query: string): FilterResult {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      this.matches = null;
+      this.ancestors = null;
+      this.render();
+      return { matches: 0, truncated: false };
+    }
+
+    const matches = new Set<string>();
+    const ancestors = new Set<string>();
+    const matchPaths = needle.includes("/");
+    let truncated = false;
+
+    const visit = (value: JsonValue, path: string, label: string): void => {
+      if (truncated) return;
+      if (path !== "" && nodeMatches(value, path, label, needle, matchPaths)) {
+        if (matches.size >= FILTER_MATCH_LIMIT) {
+          truncated = true;
+          return;
+        }
+        matches.add(path);
+        addAncestorPaths(path, ancestors);
+      }
+      if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index += 1) {
+          visit(value[index], `${path}/${index}`, `[${index}]`);
+        }
+      } else if (isObject(value)) {
+        for (const key of Object.keys(value)) {
+          visit(value[key], `${path}/${escapeJsonPointerSegment(key)}`, key);
+        }
+      }
+    };
+
+    this.roots.forEach((root) => visit(root.value, root.path, root.label));
+    this.matches = matches;
+    this.ancestors = ancestors;
+    this.render();
+    return { matches: matches.size, truncated };
+  }
+
+  /** Opens and renders every branch on the way to `path`; returns its element, or null if it is not shown. */
+  reveal(path: string): HTMLElement | null {
+    const root = this.roots.find((candidate) => path === candidate.path || path.startsWith(`${candidate.path}/`));
+    if (!root) return null;
+
+    let currentPath = root.path;
+    let element = this.elements.get(currentPath);
+    const segments = path.slice(root.path.length).split("/").slice(1);
+
+    for (const segment of segments) {
+      if (!element) return null;
+      const state = this.branches.get(element);
+      if (!state) return null;
+      const index = childPosition(state, segment);
+      if (index < 0) return null;
+
+      if (element.instanceOf(HTMLDetailsElement)) element.open = true;
+      while (state.rendered <= index) {
+        if (this.renderChildPage(element, state, 0) === 0) break;
+      }
+
+      currentPath = `${currentPath}/${segment}`;
+      element = this.elements.get(currentPath);
+    }
+
+    return element ?? null;
+  }
+
+  /** Expands breadth-first until EXPAND_ALL_ROW_LIMIT new rows are built; returns false if it stopped early. */
+  expandAll(): boolean {
+    let budget = EXPAND_ALL_ROW_LIMIT;
+    const queue: HTMLElement[] = [];
+    this.roots.forEach((root) => {
+      const element = this.elements.get(root.path);
+      if (element) queue.push(element);
+    });
+
+    for (let head = 0; head < queue.length; head += 1) {
+      const details = queue[head];
+      const state = this.branches.get(details);
+      if (!state || !details.instanceOf(HTMLDetailsElement)) continue;
+
+      details.open = true;
+      while (state.rendered < childCount(state)) {
+        if (budget <= 0) return false;
+        budget -= this.renderChildPage(details, state, 0);
+      }
+
+      for (const child of Array.from(details.children)) {
+        if (child.instanceOf(HTMLDetailsElement)) queue.push(child);
+      }
+    }
+
+    return true;
+  }
+
+  collapseAll(): void {
+    this.container.querySelectorAll("details").forEach((detail) => {
+      detail.open = false;
+    });
+  }
+
+  private render(): void {
+    this.container.empty();
+    this.elements.clear();
+
+    if (this.roots.length === 0) {
+      this.container.createDiv({
+        cls: "json-viewer__empty",
+        text: "This JSON file is empty.",
+      });
+      return;
+    }
+
+    const filtering = this.ancestors !== null;
+    const roots = filtering
+      ? this.roots.filter((root) => this.ancestors?.has(root.path) || this.matches?.has(root.path))
+      : this.roots;
+
+    if (roots.length === 0) {
+      this.container.createDiv({ cls: "json-viewer__empty", text: "No matches." });
+      return;
+    }
+
+    let openDepth = 0;
+    if (!filtering) {
+      openDepth = this.eager ? Infinity : roots.length === 1 ? 1 : 0;
+    }
+    roots.forEach((root) => this.renderNode(this.container, root, openDepth, filtering));
+  }
+
+  private renderNode(parent: HTMLElement, node: TreeNode, openDepth: number, filtering: boolean): void {
+    const { value, path, label } = node;
+    if (!Array.isArray(value) && !isObject(value)) {
+      this.renderScalar(parent, node);
+      return;
+    }
+
+    const keys = Array.isArray(value) ? null : Object.keys(value);
+    const type = Array.isArray(value) ? "array" : "object";
+    const meta = keys ? `${keys.length} keys` : `${(value as JsonValue[]).length} items`;
+
+    const details = parent.createEl("details", {
+      cls: `json-viewer__branch json-viewer__type-${type}`,
+    });
+    details.dataset.path = path;
+
+    const summary = details.createEl("summary", { cls: "json-viewer__row" });
+    summary.createSpan({ cls: "json-viewer__key", text: label });
+    summary.createSpan({ cls: "json-viewer__badge", text: type });
+    summary.createSpan({ cls: "json-viewer__meta", text: meta });
+    summary.appendChild(this.copyTemplate.cloneNode(true));
+    if (this.matches?.has(path)) summary.addClass("json-viewer__match");
+
+    // Under a filter only branches leading to a match are narrowed and opened; a branch that
+    // matches by itself stays closed and shows all of its children when opened.
+    const narrowed = filtering && (this.ancestors?.has(path) ?? false);
+    const state: BranchState = { node, keys, visibleChildren: null, rendered: 0, more: null };
+    if (narrowed) {
+      const visibleChildren: number[] = [];
+      const total = childCount(state);
+      for (let index = 0; index < total; index += 1) {
+        const childPath = childNode(state, index).path;
+        if (this.ancestors?.has(childPath) || this.matches?.has(childPath)) visibleChildren.push(index);
+      }
+      state.visibleChildren = visibleChildren;
+    }
+
+    this.elements.set(path, details);
+    this.branches.set(details, state);
+
+    details.addEventListener("toggle", () => {
+      if (details.open && state.rendered === 0) this.renderChildPage(details, state, 0);
+    });
+
+    if (openDepth > 0 || narrowed) {
+      details.open = true;
+      this.renderChildPage(details, state, openDepth - 1);
+    }
+  }
+
+  /** Renders the next page of a branch's children (all of them under a filter); returns how many rows it built. */
+  private renderChildPage(details: HTMLElement, state: BranchState, openDepth: number): number {
+    const total = childCount(state);
+    const narrowed = state.visibleChildren !== null;
+    const end = narrowed ? total : Math.min(total, state.rendered + CHILD_PAGE_SIZE);
+
+    state.more?.remove();
+    state.more = null;
+
+    for (let position = state.rendered; position < end; position += 1) {
+      this.renderNode(details, childNode(state, position), openDepth, narrowed);
+    }
+    const built = end - state.rendered;
+    state.rendered = end;
+
+    if (end < total) {
+      const remaining = total - end;
+      state.more = details.createEl("button", {
+        cls: "json-viewer__more",
+        text: `Show ${Math.min(CHILD_PAGE_SIZE, remaining)} more (${remaining} remaining)`,
+        attr: { type: "button" },
+      });
+    }
+
+    return built;
+  }
+
+  private renderScalar(parent: HTMLElement, node: TreeNode): void {
+    const type = valueType(node.value);
+    const row = parent.createDiv({ cls: "json-viewer__row json-viewer__leaf" });
+    row.addClass(`json-viewer__type-${type}`);
+    row.dataset.path = node.path;
+    row.createSpan({ cls: "json-viewer__key", text: node.label });
+    row.createSpan({ cls: "json-viewer__badge", text: type });
+    row.createSpan({ cls: "json-viewer__value", text: formatValue(node.value) });
+    row.appendChild(this.copyTemplate.cloneNode(true));
+    if (this.matches?.has(node.path)) row.addClass("json-viewer__match");
+    this.elements.set(node.path, row);
+  }
+}
+
+function childCount(state: BranchState): number {
+  if (state.visibleChildren) return state.visibleChildren.length;
+  return state.keys ? state.keys.length : (state.node.value as JsonValue[]).length;
+}
+
+/** The child at `position` among the children this branch shows. */
+function childNode(state: BranchState, position: number): TreeNode {
+  const index = state.visibleChildren ? state.visibleChildren[position] : position;
+  const { path, value } = state.node;
+  if (state.keys) {
+    const key = state.keys[index];
+    return {
+      label: key,
+      path: `${path}/${escapeJsonPointerSegment(key)}`,
+      value: (value as { [key: string]: JsonValue })[key],
+    };
+  }
+  return { label: `[${index}]`, path: `${path}/${index}`, value: (value as JsonValue[])[index] };
+}
+
+/** Where the child named by a JSON Pointer segment sits among the children this branch shows, or -1. */
+function childPosition(state: BranchState, segment: string): number {
+  let index: number;
+  if (state.keys) {
+    index = state.keys.indexOf(unescapeJsonPointerSegment(segment));
+  } else {
+    index = /^\d+$/.test(segment) ? Number(segment) : -1;
+    if (index >= (state.node.value as JsonValue[]).length) index = -1;
+  }
+  if (index < 0 || !state.visibleChildren) return index;
+  return state.visibleChildren.indexOf(index);
+}
+
+function nodeMatches(value: JsonValue, path: string, label: string, needle: string, matchPaths: boolean): boolean {
+  if (label.toLowerCase().includes(needle)) return true;
+  if (matchPaths && path.toLowerCase().includes(needle)) return true;
+  if (Array.isArray(value) || isObject(value)) return false;
+  return formatValue(value).toLowerCase().includes(needle);
+}
+
+/** Counts nodes, stopping once the count passes `limit`. */
+function countNodes(roots: TreeNode[], limit: number): number {
+  let count = 0;
+  const stack: JsonValue[] = roots.map((root) => root.value);
+  while (stack.length > 0 && count <= limit) {
+    const value = stack.pop() as JsonValue;
+    count += 1;
+    if (Array.isArray(value)) {
+      for (const child of value) stack.push(child);
+    } else if (isObject(value)) {
+      for (const key of Object.keys(value)) stack.push(value[key]);
+    }
+  }
+  return count;
 }
 
 function parseJsonDocument(data: string, extension: string): JsonDocument {
@@ -220,7 +597,7 @@ function parseJson(data: string): JsonDocument {
 }
 
 function parseJsonl(data: string): JsonDocument {
-  const roots: Array<{ label: string; path: string; value: JsonValue }> = [];
+  const roots: TreeNode[] = [];
   const errors: JsonParseError[] = [];
   const records: JsonlRecord[] = [];
   const lines = data.split(/\r?\n/);
@@ -254,70 +631,6 @@ function parseJsonl(data: string): JsonDocument {
   };
 }
 
-function renderNode(parent: HTMLElement, value: JsonValue, path: string, label: string): void {
-  if (Array.isArray(value)) {
-    const details = createBranch(parent, label, path, "array", `${value.length} items`);
-    value.forEach((item, index) => {
-      renderNode(details, item, `${path}/${index}`, `[${index}]`);
-    });
-    return;
-  }
-
-  if (isObject(value)) {
-    const entries = Object.entries(value);
-    const details = createBranch(parent, label, path, "object", `${entries.length} keys`);
-    entries.forEach(([key, child]) => {
-      renderNode(details, child, `${path}/${escapeJsonPointerSegment(key)}`, key);
-    });
-    return;
-  }
-
-  renderScalar(parent, label, value, path);
-}
-
-function createBranch(
-  parent: HTMLElement,
-  label: string,
-  path: string,
-  type: "array" | "object",
-  meta: string,
-): HTMLElement {
-  const details = parent.createEl("details", {
-    cls: `json-viewer__branch json-viewer__type-${type}`,
-    attr: { open: "" },
-  });
-  details.dataset.path = path;
-
-  const summary = details.createEl("summary", { cls: "json-viewer__row" });
-  summary.createSpan({ cls: "json-viewer__key", text: label });
-  summary.createSpan({ cls: "json-viewer__badge", text: type });
-  summary.createSpan({ cls: "json-viewer__meta", text: meta });
-  addCopyPathButton(summary, path);
-
-  return details;
-}
-
-function renderScalar(parent: HTMLElement, label: string, value: JsonValue, path: string): void {
-  const type = valueType(value);
-  const row = parent.createDiv({ cls: "json-viewer__row json-viewer__leaf" });
-  row.addClass(`json-viewer__type-${type}`);
-  row.dataset.path = path;
-  row.createSpan({ cls: "json-viewer__key", text: label });
-  row.createSpan({ cls: "json-viewer__badge", text: type });
-  row.createSpan({ cls: "json-viewer__value", text: formatValue(value) });
-  addCopyPathButton(row, path);
-}
-
-function addCopyPathButton(parent: HTMLElement, path: string): void {
-  const button = createButton(parent, "copy", "Copy JSON Pointer");
-  button.addClass("json-viewer__copy");
-  button.addEventListener("click", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    void copyToClipboard(path || "/", `Copied ${path || "/"}`);
-  });
-}
-
 function renderParseErrors(parent: HTMLElement, errors: JsonParseError[]): void {
   const box = parent.createDiv({ cls: "json-viewer__errors" });
   box.createDiv({ cls: "json-viewer__errors-title", text: "Parse errors" });
@@ -343,23 +656,68 @@ function renderJsonlSummary(parent: HTMLElement, document: JsonDocument): void {
   }
 }
 
+function renderFilterStatus(parent: HTMLElement, query: string, result: FilterResult): void {
+  parent.toggleClass("json-viewer__hidden", !query.trim());
+  if (result.truncated) {
+    parent.setText(`Showing the first ${FILTER_MATCH_LIMIT} matches`);
+  } else {
+    parent.setText(result.matches === 1 ? "1 match" : `${result.matches} matches`);
+  }
+}
+
+/** The raw source is built only when its section is first opened, then in pages of RAW_PAGE_LINES. */
 function renderRaw(parent: HTMLElement, data: string, mode: "json" | "jsonl"): void {
   const details = parent.createEl("details", { cls: "json-viewer__raw" });
   details.createEl("summary", { text: mode === "jsonl" ? "Raw JSONL" : "Raw JSON" });
-  const pre = details.createEl("pre");
-  renderHighlightedJson(pre, data);
+
+  let pre: HTMLElement | null = null;
+  let lines: string[] = [];
+  let rendered = 0;
+  let more: HTMLElement | null = null;
+
+  const renderPage = (): void => {
+    if (!pre) return;
+    more?.remove();
+    more = null;
+
+    const end = Math.min(lines.length, rendered + RAW_PAGE_LINES);
+    renderHighlightedLines(pre, lines, rendered, end);
+    rendered = end;
+
+    if (end < lines.length) {
+      const remaining = lines.length - end;
+      more = details.createEl("button", {
+        cls: "json-viewer__more",
+        text: `Show ${Math.min(RAW_PAGE_LINES, remaining)} more lines (${remaining} remaining)`,
+        attr: { type: "button" },
+      });
+      more.addEventListener("click", renderPage);
+    }
+  };
+
+  details.addEventListener("toggle", () => {
+    if (!details.open || pre) return;
+    pre = details.createEl("pre");
+    lines = data.split("\n");
+    renderPage();
+  });
 }
 
-function renderOutline(parent: HTMLElement, tree: HTMLElement, items: OutlineItem[]): void {
+function renderOutline(
+  parent: HTMLElement,
+  items: OutlineItem[],
+  truncated: boolean,
+  onSelect: (path: string) => void,
+): HTMLButtonElement[] {
   const aside = parent.createEl("aside", { cls: "json-viewer__outline" });
   aside.createDiv({ cls: "json-viewer__outline-title", text: "Outline" });
 
   if (items.length === 0) {
     aside.createDiv({ cls: "json-viewer__outline-empty", text: "No structure" });
-    return;
+    return [];
   }
 
-  items.forEach((item) => {
+  const buttons = items.map((item) => {
     const button = aside.createEl("button", {
       cls: "json-viewer__outline-item",
       attr: {
@@ -371,87 +729,89 @@ function renderOutline(parent: HTMLElement, tree: HTMLElement, items: OutlineIte
     button.style.setProperty("--json-viewer-outline-depth", String(item.depth));
     button.createSpan({ cls: "json-viewer__outline-label", text: item.label });
     button.createSpan({ cls: "json-viewer__outline-meta", text: `${item.count}` });
-    button.addEventListener("click", () => {
-      const target = findPathElement(tree, item.path);
-      if (!target) return;
-      openAncestors(target);
-      target.scrollIntoView({ block: "center", behavior: "smooth" });
-      target.addClass("json-viewer__pulse");
-      window.setTimeout(() => target.removeClass("json-viewer__pulse"), 900);
-    });
+    return button;
   });
-}
 
-function collectOutline(
-  value: JsonValue,
-  path: string,
-  label: string,
-  depth: number,
-  mode: "json" | "jsonl",
-): OutlineItem[] {
-  if (depth > OUTLINE_MAX_DEPTH) return [];
-
-  const type = outlineType(value, mode, depth);
-  if (!type) return [];
-
-  const childCount = Array.isArray(value) ? value.length : isObject(value) ? Object.keys(value).length : 0;
-  const items: OutlineItem[] = [{ label, path, depth, type, count: childCount }];
-
-  if (depth === OUTLINE_MAX_DEPTH) return items;
-
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => {
-      items.push(...collectOutline(item, `${path}/${index}`, `[${index}]`, depth + 1, mode));
-    });
-  } else if (isObject(value)) {
-    Object.entries(value).forEach(([key, child]) => {
-      items.push(...collectOutline(child, `${path}/${escapeJsonPointerSegment(key)}`, key, depth + 1, mode));
+  if (truncated) {
+    aside.createDiv({
+      cls: "json-viewer__outline-empty",
+      text: `Showing the first ${OUTLINE_ITEM_LIMIT} entries`,
     });
   }
 
-  return items;
+  aside.addEventListener("click", (event) => {
+    const button = (event.target as Element).closest<HTMLElement>(".json-viewer__outline-item");
+    if (button) onSelect(button.dataset.path ?? "");
+  });
+
+  return buttons;
 }
 
-function applyFilter(tree: HTMLElement, outlineItems: OutlineItem[], query: string): void {
+function filterOutline(buttons: HTMLButtonElement[], items: OutlineItem[], query: string): void {
   const needle = query.trim().toLowerCase();
-  const nodes = Array.from(tree.querySelectorAll<HTMLElement>("[data-path]"));
-  const outline = tree.parentElement?.parentElement?.querySelector<HTMLElement>(".json-viewer__outline");
-  const outlineButtons = Array.from(outline?.querySelectorAll<HTMLButtonElement>(".json-viewer__outline-item") ?? []);
+  buttons.forEach((button, index) => {
+    const item = items[index];
+    const haystack = `${item.path || "/"} ${item.label}`.toLowerCase();
+    button.toggleClass("json-viewer__hidden", needle !== "" && !haystack.includes(needle));
+  });
+}
 
-  if (!needle) {
-    nodes.forEach((node) => {
-      node.removeClass("json-viewer__hidden");
-      node.removeClass("json-viewer__match");
-    });
-    outlineButtons.forEach((button) => button.removeClass("json-viewer__hidden"));
-    return;
+/**
+ * Collects branches in document order up to OUTLINE_MAX_DEPTH, lowering the depth while the
+ * outline would exceed OUTLINE_ITEM_LIMIT (never below the first level of children).
+ */
+function collectOutline(roots: TreeNode[], mode: "json" | "jsonl"): { items: OutlineItem[]; truncated: boolean } {
+  const maxDepth = outlineDepth(roots, mode);
+  const items: OutlineItem[] = [];
+  let truncated = false;
+
+  const walk = (value: JsonValue, path: string, label: string, depth: number): void => {
+    if (depth > maxDepth || truncated) return;
+
+    const type = outlineType(value, mode, depth);
+    if (!type) return;
+    if (items.length >= OUTLINE_ITEM_LIMIT) {
+      truncated = true;
+      return;
+    }
+
+    const childCount = Array.isArray(value) ? value.length : isObject(value) ? Object.keys(value).length : 0;
+    items.push({ label, path, depth, type, count: childCount });
+
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        walk(value[index], `${path}/${index}`, `[${index}]`, depth + 1);
+      }
+    } else if (isObject(value)) {
+      for (const key of Object.keys(value)) {
+        walk(value[key], `${path}/${escapeJsonPointerSegment(key)}`, key, depth + 1);
+      }
+    }
+  };
+
+  roots.forEach((root) => walk(root.value, root.path, root.label, 0));
+  return { items, truncated };
+}
+
+function outlineDepth(roots: TreeNode[], mode: "json" | "jsonl"): number {
+  let level: JsonValue[] = roots.filter((root) => outlineType(root.value, mode, 0)).map((root) => root.value);
+  let total = level.length;
+
+  for (let depth = 1; depth <= OUTLINE_MAX_DEPTH; depth += 1) {
+    const next: JsonValue[] = [];
+    for (const value of level) {
+      const children = Array.isArray(value) ? value : isObject(value) ? Object.values(value) : [];
+      for (const child of children) {
+        if (Array.isArray(child) || isObject(child)) next.push(child);
+      }
+    }
+    total += next.length;
+    if (next.length === 0) return OUTLINE_MAX_DEPTH;
+    if (total > OUTLINE_ITEM_LIMIT) return Math.max(1, depth - 1);
+    level = next;
   }
 
-  const visiblePaths = new Set<string>();
-  const matchingPaths = new Set<string>();
-
-  nodes.forEach((node) => {
-    const path = node.dataset.path ?? "";
-    const haystack = `${path || "/"} ${node.textContent ?? ""}`.toLowerCase();
-    if (!haystack.includes(needle)) return;
-    matchingPaths.add(path);
-    visiblePaths.add(path);
-    addAncestorPaths(path, visiblePaths);
-  });
-
-  nodes.forEach((node) => {
-    const path = node.dataset.path ?? "";
-    node.toggleClass("json-viewer__hidden", !visiblePaths.has(path));
-    node.toggleClass("json-viewer__match", matchingPaths.has(path));
-    if (visiblePaths.has(path)) openAncestors(node);
-  });
-
-  outlineButtons.forEach((button) => {
-    const path = button.dataset.path ?? "";
-    const item = outlineItems.find((outlineItem) => outlineItem.path === path);
-    const haystack = `${path || "/"} ${item?.label ?? ""}`.toLowerCase();
-    button.toggleClass("json-viewer__hidden", !haystack.includes(needle));
-  });
+  return OUTLINE_MAX_DEPTH;
 }
 
 function addAncestorPaths(path: string, paths: Set<string>): void {
@@ -469,28 +829,13 @@ function parentPointerPath(path: string): string {
   return path.slice(0, slash);
 }
 
-function findPathElement(tree: HTMLElement, path: string): HTMLElement | undefined {
-  return Array.from(tree.querySelectorAll<HTMLElement>("[data-path]")).find((element) => {
-    return element.dataset.path === path;
-  });
-}
-
-function openAncestors(element: HTMLElement): void {
-  let current: HTMLElement | null = element;
-  while (current) {
-    if (current.instanceOf(HTMLDetailsElement)) current.open = true;
-    current = current.parentElement;
-  }
-}
-
-function renderHighlightedJson(parent: HTMLElement, data: string): void {
-  const lines = data.split("\n");
-  lines.forEach((line, index) => {
+function renderHighlightedLines(parent: HTMLElement, lines: string[], start: number, end: number): void {
+  for (let index = start; index < end; index += 1) {
     const lineEl = parent.createDiv({ cls: "json-viewer__source-line" });
     lineEl.createSpan({ cls: "json-viewer__line-number", text: String(index + 1) });
     const code = lineEl.createSpan({ cls: "json-viewer__source-code" });
-    highlightJsonLine(code, line);
-  });
+    highlightJsonLine(code, lines[index]);
+  }
 }
 
 function highlightJsonLine(parent: HTMLElement, line: string): void {
@@ -627,6 +972,10 @@ function formatValue(value: JsonValue): string {
 
 function escapeJsonPointerSegment(segment: string): string {
   return segment.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
+function unescapeJsonPointerSegment(segment: string): string {
+  return segment.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function getErrorMessage(error: unknown): string {
