@@ -19,6 +19,7 @@ const EXPAND_ALL_ROW_LIMIT = 5000;
 const FILTER_MATCH_LIMIT = 1000;
 const FILTER_DEBOUNCE_MS = 200;
 const RAW_PAGE_LINES = 2000;
+const RAW_PAGE_CHARACTERS = 16000;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -302,7 +303,7 @@ class JsonTree {
 
     const visit = (value: JsonValue, path: string, label: string): void => {
       if (truncated) return;
-      if (path !== "" && nodeMatches(value, path, label, needle, matchPaths)) {
+      if ((path !== "" || (!Array.isArray(value) && !isObject(value))) && nodeMatches(value, path, label, needle, matchPaths)) {
         if (matches.size >= FILTER_MATCH_LIMIT) {
           truncated = true;
           return;
@@ -673,6 +674,8 @@ function renderRaw(parent: HTMLElement, data: string, mode: "json" | "jsonl"): v
   let pre: HTMLElement | null = null;
   let lines: string[] = [];
   let rendered = 0;
+  let column = 0;
+  let currentCode: HTMLElement | null = null;
   let more: HTMLElement | null = null;
 
   const renderPage = (): void => {
@@ -680,15 +683,30 @@ function renderRaw(parent: HTMLElement, data: string, mode: "json" | "jsonl"): v
     more?.remove();
     more = null;
 
-    const end = Math.min(lines.length, rendered + RAW_PAGE_LINES);
-    renderHighlightedLines(pre, lines, rendered, end);
-    rendered = end;
+    let characters = 0;
+    let completedLines = 0;
+    while (rendered < lines.length && characters < RAW_PAGE_CHARACTERS && completedLines < RAW_PAGE_LINES) {
+      if (!currentCode) {
+        const lineEl = pre.createDiv({ cls: "json-viewer__source-line" });
+        lineEl.createSpan({ cls: "json-viewer__line-number", text: String(rendered + 1) });
+        currentCode = lineEl.createSpan({ cls: "json-viewer__source-code" });
+      }
+      const chunk = lines[rendered].slice(column, column + RAW_PAGE_CHARACTERS - characters);
+      highlightJsonLine(currentCode, chunk);
+      characters += Math.max(1, chunk.length);
+      column += chunk.length;
+      if (column === lines[rendered].length) {
+        rendered += 1;
+        column = 0;
+        currentCode = null;
+        completedLines += 1;
+      }
+    }
 
-    if (end < lines.length) {
-      const remaining = lines.length - end;
+    if (rendered < lines.length) {
       more = details.createEl("button", {
         cls: "json-viewer__more",
-        text: `Show ${Math.min(RAW_PAGE_LINES, remaining)} more lines (${remaining} remaining)`,
+        text: "Show more source",
         attr: { type: "button" },
       });
       more.addEventListener("click", renderPage);
@@ -827,15 +845,6 @@ function parentPointerPath(path: string): string {
   const slash = path.lastIndexOf("/");
   if (slash <= 0) return "";
   return path.slice(0, slash);
-}
-
-function renderHighlightedLines(parent: HTMLElement, lines: string[], start: number, end: number): void {
-  for (let index = start; index < end; index += 1) {
-    const lineEl = parent.createDiv({ cls: "json-viewer__source-line" });
-    lineEl.createSpan({ cls: "json-viewer__line-number", text: String(index + 1) });
-    const code = lineEl.createSpan({ cls: "json-viewer__source-code" });
-    highlightJsonLine(code, lines[index]);
-  }
 }
 
 function highlightJsonLine(parent: HTMLElement, line: string): void {

@@ -1,4 +1,6 @@
 .json-viewer {
+  container-name: json-viewer;
+  container-type: inline-size;
   --json-viewer-border: var(--background-modifier-border);
   --json-viewer-muted: var(--text-muted);
   --json-viewer-code: var(--font-monospace);
@@ -390,14 +392,22 @@
   color: var(--json-viewer-null);
 }
 
-@media (max-width: 860px) {
-  .json-viewer__header,
-  .json-viewer__toolbar {
+@container json-viewer (max-width: 860px) {
+  .json-viewer__header {
     align-items: stretch;
     flex-direction: column;
   }
 
+  .json-viewer__toolbar {
+    flex-wrap: wrap;
+  }
+
+  .json-viewer__search {
+    flex: 1 1 150px;
+  }
+
   .json-viewer__search input {
+    min-width: 0;
     width: 100%;
   }
 
@@ -406,7 +416,7 @@
   }
 
   .json-viewer__outline {
-    max-height: none;
+    max-height: min(32vh, 240px);
     order: -1;
     position: static;
   }
